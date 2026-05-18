@@ -129,6 +129,5 @@ python -m pip install pyinstaller
 
 ## 许可证
 
-建议在公开仓库中使用 MIT 许可证（宽松、易于复用）。  
-如你已选择其他许可证，请以仓库中的 `LICENSE` 文件为准。
+本仓库使用 MIT License，详见 `LICENSE` 文件。
 
