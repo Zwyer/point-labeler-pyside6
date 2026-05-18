@@ -1,0 +1,2 @@
+"""Point Labeler package."""
+
