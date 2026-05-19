@@ -195,6 +195,7 @@ class PointCloudViewer(QWidget):
     def reset_camera(self) -> None:
         if self._backend_ready:
             self._plotter.reset_camera()
+            self._invalidate_projection_cache()
             self._plotter.render()
 
     def clear(self) -> None:
@@ -1316,6 +1317,7 @@ class PointCloudViewer(QWidget):
 
             camera.position = tuple((pos + delta).tolist())
             camera.focal_point = tuple((focal + delta).tolist())
+            self._invalidate_projection_cache()
             self._plotter.render()
             return True
         except Exception:
