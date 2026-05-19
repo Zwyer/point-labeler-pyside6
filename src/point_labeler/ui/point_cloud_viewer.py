@@ -71,6 +71,7 @@ class PointCloudViewer(QWidget):
         self._brush_dragging = False
         self._brush_center_xy: tuple[float, float] | None = None
         self._brush_last_apply_xy: tuple[float, float] | None = None
+        self._camera_indicator_visible = False
         self._origin_logged = False
         self._brush_cursor_cache_key: tuple[int, int] | None = None
         self._brush_cursor_cache: QCursor | None = None
@@ -86,6 +87,9 @@ class PointCloudViewer(QWidget):
         self._box_mapper2d = None
         self._box_polydata = None
         self._box_preview_visible = False
+        self._camera_indicator_actor = None
+        self._camera_indicator_mapper = None
+        self._camera_indicator_source = None
         self._original_to_filtered: np.ndarray | None = None
 
         layout = QVBoxLayout(self)
@@ -129,6 +133,8 @@ class PointCloudViewer(QWidget):
         self._overlay.show()
         self._overlay.raise_()
         self._setup_box_preview_actor()
+        self._setup_camera_indicator_actor()
+        self._set_camera_indicator_visible(False)
         logger.debug(
             "viewer backend ready: plotter=%s overlay=%s",
             self._plotter.__class__.__name__,
@@ -206,6 +212,7 @@ class PointCloudViewer(QWidget):
         self._original_to_filtered = None
         self._scene_diag = None
         self._invalidate_projection_cache()
+        self._set_camera_indicator_visible(False)
         self._remove_point_actor()
         if self._backend_ready:
             self._plotter.render()
@@ -494,6 +501,7 @@ class PointCloudViewer(QWidget):
             self._alt_down = False
             self._alt_was_pressed = False
             self._annotation_active = False
+            self._set_camera_indicator_visible(False)
             self._clear_annotation_primitives()
             return False
 
@@ -507,6 +515,7 @@ class PointCloudViewer(QWidget):
         if et in (QEvent.Resize, QEvent.Move, QEvent.Show):
             if et == QEvent.Resize:
                 self._invalidate_projection_cache()
+                self._update_camera_indicator_actor()
             self._sync_overlay_geometry()
             return False
 
@@ -636,6 +645,7 @@ class PointCloudViewer(QWidget):
             self._polygon_drag_vertex_idx = None
             if self._annotation_mode == "刷子":
                 self._brush_center_xy = None
+            self._set_camera_indicator_visible(False)
             self._update_overlay()
             return False
 
@@ -655,6 +665,7 @@ class PointCloudViewer(QWidget):
                 self._brush_dragging = False
                 self._brush_center_xy = None
                 self._brush_last_apply_xy = None
+                self._set_camera_indicator_visible(False)
                 self._update_overlay()
                 return True
             return True
@@ -686,15 +697,18 @@ class PointCloudViewer(QWidget):
 
             if et == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
                 self._polygon_drag_vertex_idx = None
+                self._set_camera_indicator_visible(False)
                 return True
 
             if et == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
                 self._apply_polygon_selection()
+                self._set_camera_indicator_visible(False)
                 return True
 
             if et == QEvent.MouseButtonPress and event.button() == Qt.MiddleButton:
                 self._polygon_points_xy.clear()
                 self._polygon_drag_vertex_idx = None
+                self._set_camera_indicator_visible(False)
                 self._update_overlay()
                 return True
 
@@ -1075,6 +1089,59 @@ class PointCloudViewer(QWidget):
 
         self._plotter.renderer.AddActor2D(self._box_actor2d)
 
+    def _setup_camera_indicator_actor(self) -> None:
+        if not self._backend_ready or self._plotter is None:
+            return
+        if self._camera_indicator_actor is not None:
+            return
+        try:
+            from vtkmodules.vtkCommonCore import vtkPoints
+            from vtkmodules.vtkCommonDataModel import vtkPolyData
+            from vtkmodules.vtkFiltersSources import vtkSphereSource
+            from vtkmodules.vtkRenderingCore import vtkPolyDataMapper
+        except Exception:
+            logger.exception("setup_camera_indicator_actor failed: vtk imports unavailable")
+            return
+
+        self._camera_indicator_source = vtkSphereSource()
+        self._camera_indicator_source.SetRadius(0.25)
+        self._camera_indicator_source.SetThetaResolution(20)
+        self._camera_indicator_source.SetPhiResolution(20)
+
+        self._camera_indicator_mapper = vtkPolyDataMapper()
+        self._camera_indicator_mapper.SetInputConnection(self._camera_indicator_source.GetOutputPort())
+
+        from vtkmodules.vtkRenderingCore import vtkActor
+
+        self._camera_indicator_actor = vtkActor()
+        self._camera_indicator_actor.SetMapper(self._camera_indicator_mapper)
+        prop = self._camera_indicator_actor.GetProperty()
+        prop.SetColor(0.0, 0.82, 1.0)
+        prop.SetOpacity(0.95)
+        prop.SetAmbient(0.35)
+        prop.SetDiffuse(0.75)
+        self._camera_indicator_actor.SetVisibility(False)
+        self._plotter.renderer.AddActor(self._camera_indicator_actor)
+
+    def _set_camera_indicator_visible(self, visible: bool) -> None:
+        self._camera_indicator_visible = bool(visible)
+        self._update_camera_indicator_actor()
+
+    def _update_camera_indicator_actor(self) -> None:
+        if self._plotter is None or self._camera_indicator_actor is None:
+            return
+        try:
+            camera = self._plotter.camera
+            focal = np.asarray(camera.focal_point, dtype=np.float64)
+            if focal.shape[0] < 3 or not np.isfinite(focal[:3]).all():
+                self._camera_indicator_actor.SetVisibility(False)
+                return
+            self._camera_indicator_actor.SetPosition(float(focal[0]), float(focal[1]), float(focal[2]))
+            self._camera_indicator_actor.SetVisibility(self._camera_indicator_visible)
+            self._plotter.render()
+        except Exception:
+            logger.exception("update_camera_indicator_actor failed")
+
     def _qt_xy_to_vtk_display(self, xy: tuple[float, float]) -> tuple[float, float]:
         dpr = self._pixel_ratio()
         qt_h = float(max(1, int(self._plotter.height()))) if self._plotter is not None else 1.0
@@ -1175,6 +1242,7 @@ class PointCloudViewer(QWidget):
 
     def _on_end_interaction(self) -> None:
         self._invalidate_projection_cache()
+        self._update_camera_indicator_actor()
         self._update_overlay()
 
     def _clear_annotation_primitives(self) -> None:

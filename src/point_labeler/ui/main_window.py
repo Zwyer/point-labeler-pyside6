@@ -617,8 +617,6 @@ class MainWindow(QMainWindow):
         self._render_current_frame(reset_camera=False)
 
     def _on_toggle_class_lock_by_id(self, class_id: int) -> None:
-        self._selected_class_id = class_id
-        self._select_class_row(class_id)
         cls = self._class_palette.get(class_id)
         if cls is None:
             return
@@ -627,8 +625,6 @@ class MainWindow(QMainWindow):
         self._refresh_class_list()
 
     def _on_toggle_class_visibility_by_id(self, class_id: int) -> None:
-        self._selected_class_id = class_id
-        self._select_class_row(class_id)
         cls = self._class_palette.get(class_id)
         if cls is None:
             return
