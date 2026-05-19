@@ -87,6 +87,7 @@ class MainWindow(QMainWindow):
 
         self._annotation_mode: str = "浏览"
         self._brush_radius: float = 30.0
+        self._pan_speed_multiplier: float = 1.0
         self._undo_stack: list[LabelEditAction] = []
         self._max_undo_steps = 200
         self._brush_stroke_active = False
@@ -224,6 +225,18 @@ class MainWindow(QMainWindow):
         self.btn_reset_camera.clicked.connect(self._on_reset_camera)
         viewer_tools.addWidget(self.btn_reset_camera)
 
+        viewer_tools.addWidget(QLabel("移动速度"))
+        self.slider_pan_speed = QSlider(Qt.Horizontal)
+        self.slider_pan_speed.setRange(20, 300)
+        self.slider_pan_speed.setValue(100)
+        self.slider_pan_speed.setFixedWidth(120)
+        self.slider_pan_speed.valueChanged.connect(self._on_pan_speed_changed)
+        viewer_tools.addWidget(self.slider_pan_speed)
+
+        self.lbl_pan_speed = QLabel("1.00x")
+        self.lbl_pan_speed.setMinimumWidth(46)
+        viewer_tools.addWidget(self.lbl_pan_speed)
+
         viewer_tools.addStretch(1)
         right_layout.addLayout(viewer_tools)
 
@@ -235,6 +248,7 @@ class MainWindow(QMainWindow):
         self.viewer.set_brush_stroke_end_callback(self._on_brush_stroke_end)
         self.viewer.set_annotation_mode(self._annotation_mode)
         self.viewer.set_brush_radius(self._brush_radius)
+        self.viewer.set_pan_speed_multiplier(self._pan_speed_multiplier)
         right_layout.addWidget(self.viewer, 1)
 
         body.addWidget(right, 1)
@@ -681,6 +695,23 @@ class MainWindow(QMainWindow):
         candidate = np.asarray(indices, dtype=np.int64)
         if candidate.size == 0:
             return
+        total = int(self._current_semantic_labels.shape[0])
+        in_range = (candidate >= 0) & (candidate < total)
+        if not np.any(in_range):
+            self._log.debug("apply_label skipped: all target points are out of range")
+            return
+        candidate = candidate[in_range]
+
+        hidden_ids = np.array(
+            [cid for cid, cls in self._class_palette.items() if not cls.visible],
+            dtype=np.uint16,
+        )
+        if hidden_ids.size > 0:
+            hidden_mask = np.isin(self._current_semantic_labels[candidate], hidden_ids)
+            candidate = candidate[~hidden_mask]
+        if candidate.size == 0:
+            self._log.debug("apply_label skipped: all target points are hidden")
+            return
 
         locked_ids = np.array(
             [cid for cid, cls in self._class_palette.items() if cls.locked and cid != self._selected_class_id],
@@ -723,7 +754,8 @@ class MainWindow(QMainWindow):
             incremental_ok = self.viewer.update_rgb_for_original_indices(changed_indices, color)
         if not incremental_ok:
             self._render_current_frame(reset_camera=False)
-        self._auto_save_current_frame()
+        if self._annotation_mode != "刷子" or not self._brush_stroke_active:
+            self._auto_save_current_frame()
 
     def _on_undo_last_action(self) -> None:
         if self._current_semantic_labels is None:
@@ -789,6 +821,7 @@ class MainWindow(QMainWindow):
             old_labels = self._brush_stroke_old_labels[changed_indices]
             self._push_undo_action(changed_indices, old_labels)
             self._log.debug("brush_stroke_end undo_points=%d", int(changed_indices.size))
+            self._auto_save_current_frame()
         self._reset_brush_stroke_state()
 
     def _on_point_size_changed(self, value: int) -> None:
@@ -802,6 +835,12 @@ class MainWindow(QMainWindow):
 
     def _on_reset_camera(self) -> None:
         self.viewer.reset_camera()
+
+    def _on_pan_speed_changed(self, value: int) -> None:
+        multiplier = max(0.2, float(value) / 100.0)
+        self._pan_speed_multiplier = multiplier
+        self.lbl_pan_speed.setText(f"{multiplier:.2f}x")
+        self.viewer.set_pan_speed_multiplier(multiplier)
 
     def _on_theme_changed(self) -> None:
         mode = self.combo_theme.currentData()

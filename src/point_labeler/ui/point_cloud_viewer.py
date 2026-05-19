@@ -56,6 +56,11 @@ class PointCloudViewer(QWidget):
         self._current_xyz: np.ndarray | None = None
         self._current_rgb_colors: np.ndarray | None = None
         self._filtered_to_original: np.ndarray | None = None
+        self._scene_diag: float | None = None
+        self._projection_cache: tuple[np.ndarray, np.ndarray] | None = None
+        self._projection_cache_size: tuple[int, int] | None = None
+        self._projection_cache_count: int = -1
+        self._pan_speed_multiplier = 1.0
 
         self._polygon_callback: PolygonCallback | None = None
         self._brush_callback: BrushCallback | None = None
@@ -65,6 +70,7 @@ class PointCloudViewer(QWidget):
 
         self._brush_dragging = False
         self._brush_center_xy: tuple[float, float] | None = None
+        self._brush_last_apply_xy: tuple[float, float] | None = None
         self._origin_logged = False
         self._brush_cursor_cache_key: tuple[int, int] | None = None
         self._brush_cursor_cache: QCursor | None = None
@@ -104,18 +110,14 @@ class PointCloudViewer(QWidget):
         self._plotter.setMouseTracking(True)
         self._plotter.setFocusPolicy(Qt.StrongFocus)
         self._plotter.enable_trackball_style()
-        try:
-            self._plotter.interactor.SetMotionFactor(1.0)
-            self._plotter.interactor.SetMouseWheelMotionFactor(1.0)
-        except Exception:
-            pass
+        self._apply_navigation_speed()
 
         self._plotter.installEventFilter(self)
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
         try:
-            self._plotter.iren.add_observer("EndInteractionEvent", lambda *_: self._update_overlay())
+            self._plotter.iren.add_observer("EndInteractionEvent", lambda *_: self._on_end_interaction())
         except Exception:
             pass
 
@@ -186,6 +188,10 @@ class PointCloudViewer(QWidget):
         if self._current_points is not None:
             self.set_points(self._current_points, reset_camera=False, rgb_colors=self._current_rgb_colors)
 
+    def set_pan_speed_multiplier(self, multiplier: float) -> None:
+        self._pan_speed_multiplier = min(10.0, max(0.05, float(multiplier)))
+        self._apply_navigation_speed()
+
     def reset_camera(self) -> None:
         if self._backend_ready:
             self._plotter.reset_camera()
@@ -197,6 +203,8 @@ class PointCloudViewer(QWidget):
         self._current_rgb_colors = None
         self._filtered_to_original = None
         self._original_to_filtered = None
+        self._scene_diag = None
+        self._invalidate_projection_cache()
         self._remove_point_actor()
         if self._backend_ready:
             self._plotter.render()
@@ -219,6 +227,8 @@ class PointCloudViewer(QWidget):
         finite_mask = np.isfinite(xyz).all(axis=1)
         xyz = xyz[finite_mask]
         self._current_xyz = xyz
+        self._scene_diag = self._compute_scene_diag(xyz)
+        self._invalidate_projection_cache()
         self._filtered_to_original = np.where(finite_mask)[0].astype(np.int64, copy=False)
         self._original_to_filtered = np.full(points.shape[0], -1, dtype=np.int64)
         self._original_to_filtered[self._filtered_to_original] = np.arange(
@@ -324,7 +334,7 @@ class PointCloudViewer(QWidget):
         if self._current_xyz is None or self._current_xyz.shape[0] == 0:
             return np.array([], dtype=np.int64)
 
-        projected = self._project_points_to_display(self._current_xyz)
+        projected = self._get_cached_projection()
         if projected is None:
             return np.array([], dtype=np.int64)
 
@@ -358,7 +368,7 @@ class PointCloudViewer(QWidget):
         ):
             return np.array([], dtype=np.int64)
 
-        projected = self._project_points_to_display(self._current_xyz)
+        projected = self._get_cached_projection()
         if projected is None:
             return np.array([], dtype=np.int64)
 
@@ -394,6 +404,42 @@ class PointCloudViewer(QWidget):
         if self._filtered_to_original is None:
             return selected_local.astype(np.int64, copy=False)
         return self._filtered_to_original[selected_local]
+
+    def pick_points_in_display_stroke(
+        self,
+        start_xy: tuple[float, float],
+        end_xy: tuple[float, float],
+        radius_px: float,
+    ) -> np.ndarray:
+        if self._current_xyz is None or self._current_xyz.shape[0] == 0:
+            return np.array([], dtype=np.int64)
+
+        projected = self._get_cached_projection()
+        if projected is None:
+            return np.array([], dtype=np.int64)
+
+        disp_xy, valid = projected
+        ax, ay = float(start_xy[0]), float(start_xy[1])
+        bx, by = float(end_xy[0]), float(end_xy[1])
+        abx, aby = (bx - ax), (by - ay)
+        len2 = abx * abx + aby * aby
+        if len2 <= 1e-12:
+            return self.pick_points_in_display_circle(end_xy, radius_px)
+
+        px = disp_xy[:, 0]
+        py = disp_xy[:, 1]
+        t = ((px - ax) * abx + (py - ay) * aby) / len2
+        t = np.clip(t, 0.0, 1.0)
+        cx = ax + t * abx
+        cy = ay + t * aby
+        dx = px - cx
+        dy = py - cy
+        dist2 = dx * dx + dy * dy
+        local = np.where(valid & (dist2 <= float(radius_px) * float(radius_px)))[0].astype(np.int64, copy=False)
+
+        if self._filtered_to_original is None:
+            return local
+        return self._filtered_to_original[local]
 
     def eventFilter(self, obj, event):  # type: ignore[override]
         if not self._backend_ready or self._plotter is None:
@@ -458,6 +504,8 @@ class PointCloudViewer(QWidget):
             return False
 
         if et in (QEvent.Resize, QEvent.Move, QEvent.Show):
+            if et == QEvent.Resize:
+                self._invalidate_projection_cache()
             self._sync_overlay_geometry()
             return False
 
@@ -583,6 +631,7 @@ class PointCloudViewer(QWidget):
         if camera_active:
             self._end_brush_stroke_if_needed()
             self._brush_dragging = False
+            self._brush_last_apply_xy = None
             self._polygon_drag_vertex_idx = None
             if self._annotation_mode == "刷子":
                 self._brush_center_xy = None
@@ -592,6 +641,7 @@ class PointCloudViewer(QWidget):
         if self._annotation_mode == "刷子":
             if et == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
                 self._brush_dragging = True
+                self._brush_last_apply_xy = None
                 if self._brush_stroke_begin_callback is not None:
                     self._brush_stroke_begin_callback()
                 self._apply_brush_from_event(obj, event, apply=True)
@@ -603,6 +653,7 @@ class PointCloudViewer(QWidget):
                 self._end_brush_stroke_if_needed()
                 self._brush_dragging = False
                 self._brush_center_xy = None
+                self._brush_last_apply_xy = None
                 self._update_overlay()
                 return True
             return True
@@ -662,7 +713,11 @@ class PointCloudViewer(QWidget):
         if not apply or self._brush_callback is None:
             return
 
-        indices = self.pick_points_in_display_circle(xy, self._brush_radius)
+        if self._brush_last_apply_xy is None:
+            indices = self.pick_points_in_display_circle(xy, self._brush_radius)
+        else:
+            indices = self.pick_points_in_display_stroke(self._brush_last_apply_xy, xy, self._brush_radius)
+        self._brush_last_apply_xy = xy
         if indices.size > 0:
             self._log_brush_selection_points(indices, max_points=8)
             self._brush_callback(indices)
@@ -844,45 +899,51 @@ class PointCloudViewer(QWidget):
         )
 
     def _log_brush_selection_points(self, indices: np.ndarray, max_points: int = 8) -> None:
-        if self._current_xyz is None or self._filtered_to_original is None:
+        if not logger.isEnabledFor(logging.DEBUG):
             return
-        if indices.size == 0:
-            logger.debug("brush_selected_points count=0")
-            return
+        try:
+            if self._current_xyz is None or self._original_to_filtered is None:
+                return
+            if indices.size == 0:
+                logger.debug("brush_selected_points count=0")
+                return
 
-        max_idx = int(np.max(indices))
-        if max_idx >= int(self._filtered_to_original.shape[0]):
-            logger.debug("brush_selected_points count=%d sample=[index_mismatch]", int(indices.size))
-            return
-        local_map = np.full(self._filtered_to_original.shape[0], -1, dtype=np.int64)
-        local_map[self._filtered_to_original] = np.arange(self._filtered_to_original.shape[0], dtype=np.int64)
-        local_indices = local_map[indices]
-        valid_local = local_indices >= 0
-        if not np.any(valid_local):
-            return
-        valid_indices = indices[valid_local]
-        local_indices = local_indices[valid_local]
-        xyz = self._current_xyz[local_indices]
-        projected = self._project_points_to_display(xyz)
-        if projected is None:
-            return
-        disp_xy, valid_disp = projected
+            idx = np.asarray(indices, dtype=np.int64)
+            in_range = (idx >= 0) & (idx < self._original_to_filtered.shape[0])
+            if not np.any(in_range):
+                logger.debug("brush_selected_points count=%d sample=[index_mismatch]", int(indices.size))
+                return
+            idx = idx[in_range]
 
-        count = int(indices.size)
-        samples: list[str] = []
-        limit = min(int(max_points), int(local_indices.size))
-        for i in range(limit):
-            world = xyz[i]
-            if valid_disp[i]:
-                sx, sy = float(disp_xy[i, 0]), float(disp_xy[i, 1])
-                samples.append(
-                    f"id={int(valid_indices[i])} world=({world[0]:.3f},{world[1]:.3f},{world[2]:.3f}) screen=({sx:.1f},{sy:.1f})"
-                )
-            else:
-                samples.append(
-                    f"id={int(valid_indices[i])} world=({world[0]:.3f},{world[1]:.3f},{world[2]:.3f}) screen=(N/A,N/A)"
-                )
-        logger.debug("brush_selected_points count=%d sample=[%s]", count, "; ".join(samples))
+            local_indices = self._original_to_filtered[idx]
+            valid_local = local_indices >= 0
+            if not np.any(valid_local):
+                return
+            valid_indices = idx[valid_local]
+            local_indices = local_indices[valid_local]
+            xyz = self._current_xyz[local_indices]
+            projected = self._project_points_to_display(xyz)
+            if projected is None:
+                return
+            disp_xy, valid_disp = projected
+
+            count = int(indices.size)
+            samples: list[str] = []
+            limit = min(int(max_points), int(local_indices.size))
+            for i in range(limit):
+                world = xyz[i]
+                if valid_disp[i]:
+                    sx, sy = float(disp_xy[i, 0]), float(disp_xy[i, 1])
+                    samples.append(
+                        f"id={int(valid_indices[i])} world=({world[0]:.3f},{world[1]:.3f},{world[2]:.3f}) screen=({sx:.1f},{sy:.1f})"
+                    )
+                else:
+                    samples.append(
+                        f"id={int(valid_indices[i])} world=({world[0]:.3f},{world[1]:.3f},{world[2]:.3f}) screen=(N/A,N/A)"
+                    )
+            logger.debug("brush_selected_points count=%d sample=[%s]", count, "; ".join(samples))
+        except Exception:
+            logger.exception("log_brush_selection_points failed")
 
     def _project_points_to_display(self, xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
         if self._plotter is None:
@@ -922,6 +983,30 @@ class PointCloudViewer(QWidget):
         except Exception:
             logger.exception("project_points_to_display failed")
             return None
+
+    def _get_cached_projection(self) -> tuple[np.ndarray, np.ndarray] | None:
+        if self._plotter is None or self._current_xyz is None:
+            return None
+        size = (int(self._plotter.width()), int(self._plotter.height()))
+        count = int(self._current_xyz.shape[0])
+        if (
+            self._projection_cache is not None
+            and self._projection_cache_size == size
+            and self._projection_cache_count == count
+        ):
+            return self._projection_cache
+        projected = self._project_points_to_display(self._current_xyz)
+        if projected is None:
+            return None
+        self._projection_cache = projected
+        self._projection_cache_size = size
+        self._projection_cache_count = count
+        return projected
+
+    def _invalidate_projection_cache(self) -> None:
+        self._projection_cache = None
+        self._projection_cache_size = None
+        self._projection_cache_count = -1
 
     @staticmethod
     def _points_in_polygon(points_xy: np.ndarray, polygon_xy: np.ndarray) -> np.ndarray:
@@ -1087,6 +1172,10 @@ class PointCloudViewer(QWidget):
             self._overlay.rect(),
         )
 
+    def _on_end_interaction(self) -> None:
+        self._invalidate_projection_cache()
+        self._update_overlay()
+
     def _clear_annotation_primitives(self) -> None:
         logger.debug(
             "clear_annotation brush_center=%s poly_verts=%d",
@@ -1095,6 +1184,7 @@ class PointCloudViewer(QWidget):
         )
         self._brush_center_xy = None
         self._brush_dragging = False
+        self._brush_last_apply_xy = None
         self._polygon_points_xy.clear()
         self._polygon_drag_vertex_idx = None
         self._update_overlay()
@@ -1215,8 +1305,13 @@ class PointCloudViewer(QWidget):
                 return False
             right_dir = right / right_norm
 
-            # Pan step scales with camera distance to keep controls consistent.
-            step = max(1e-3, float(view_norm) * 0.03)
+            # Use scene-scale-based pan step so speed remains stable across zoom levels.
+            scene_diag = self._scene_diag
+            if scene_diag is not None and np.isfinite(scene_diag) and scene_diag > 1e-9:
+                step = max(1e-3, float(scene_diag) * 0.01)
+            else:
+                step = max(1e-3, float(view_norm) * 0.03)
+            step *= self._pan_speed_multiplier
             delta = right_dir * (float(dir_x) * step) + up_dir * (float(dir_y) * step)
 
             camera.position = tuple((pos + delta).tolist())
@@ -1226,6 +1321,18 @@ class PointCloudViewer(QWidget):
         except Exception:
             logger.exception("pan_view failed")
             return False
+
+    @staticmethod
+    def _compute_scene_diag(xyz: np.ndarray) -> float | None:
+        if xyz.ndim != 2 or xyz.shape[0] == 0 or xyz.shape[1] < 3:
+            return None
+        mins = np.min(xyz[:, :3], axis=0)
+        maxs = np.max(xyz[:, :3], axis=0)
+        extent = maxs - mins
+        diag = float(np.linalg.norm(extent))
+        if not np.isfinite(diag) or diag <= 0.0:
+            return None
+        return diag
 
     def _is_alt_pressed(self, event=None) -> bool:
         mods = Qt.NoModifier
@@ -1243,3 +1350,14 @@ class PointCloudViewer(QWidget):
         except Exception:
             pass
         return self._alt_down or bool(mods & Qt.AltModifier)
+
+    def _apply_navigation_speed(self) -> None:
+        if self._plotter is None:
+            return
+        try:
+            interactor = self._plotter.interactor
+            speed = float(self._pan_speed_multiplier)
+            interactor.SetMotionFactor(speed)
+            interactor.SetMouseWheelMotionFactor(speed)
+        except Exception:
+            pass
